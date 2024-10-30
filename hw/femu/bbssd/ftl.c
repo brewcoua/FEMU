@@ -1,4 +1,5 @@
 #include "ftl.h"
+#include <time.h>
 
 //#define FEMU_DEBUG_FTL
 
@@ -688,7 +689,7 @@ static struct line *select_victim_line(struct ssd *ssd, bool force)
 }
 
 /* here ppa identifies the block we want to clean */
-static void clean_one_block(struct ssd *ssd, struct ppa *ppa)
+static int clean_one_block(struct ssd *ssd, struct ppa *ppa)
 {
     struct ssdparams *spp = &ssd->sp;
     struct nand_page *pg_iter = NULL;
@@ -708,6 +709,8 @@ static void clean_one_block(struct ssd *ssd, struct ppa *ppa)
     }
 
     ftl_assert(get_blk(ssd, ppa)->vpc == cnt);
+
+    return cnt; // number of valid pages moved
 }
 
 static void mark_line_free(struct ssd *ssd, struct ppa *ppa)
@@ -719,6 +722,48 @@ static void mark_line_free(struct ssd *ssd, struct ppa *ppa)
     /* move this line to free line list */
     QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
     lm->free_line_cnt++;
+}
+
+uint64_t iops_count = 0;
+uint64_t bytes_transferred = 0;
+uint64_t erased_blocks_count = 0;
+uint64_t valid_pages_moved = 0;
+
+time_t start_time;
+bool metrics_initialized = false;
+
+static inline void log_metrics(void) {
+    if (!start_time) {
+        start_time = time(NULL);
+    }
+
+    time_t current_time = time(NULL) - start_time;
+
+    if (current_time < 30) {
+        printf("[I/O] Waiting for 30 seconds before logging metrics\n");
+        return;
+    } else if (!metrics_initialized) {
+        printf("~~~~~~~ Metrics ~~~~~~~\n");
+        metrics_initialized = true;
+    }
+
+    // Log IOPS and throughput metrics every second
+    printf("$%lu,%lu,%.2f\n", current_time, iops_count, (double) bytes_transferred / 1024.0 / 1024.0);
+
+    // Log GC and WAF metrics every 10s
+    if (current_time % 10 == 0) {
+        printf("#%lu,%lu,%lu\n",
+            current_time, erased_blocks_count, valid_pages_moved,
+        );
+
+        // Reset GC and WAF metrics
+        erased_blocks_count = 0;
+        valid_pages_moved = 0;
+    }
+
+    // Reset IOPS and throughput
+    iops_count = 0;
+    bytes_transferred = 0;
 }
 
 static int do_gc(struct ssd *ssd, bool force)
@@ -746,7 +791,10 @@ static int do_gc(struct ssd *ssd, bool force)
             ppa.g.lun = lun;
             ppa.g.pl = 0;
             lunp = get_lun(ssd, &ppa);
-            clean_one_block(ssd, &ppa);
+            int pages_moved = clean_one_block(ssd, &ppa); // Get number of valid pages moved
+            valid_pages_moved += pages_moved; // Track total valid pages moved
+            erased_blocks_count++; // Increment erased blocks count
+            total_flash_writes += pages_moved * spp->secs_per_pg; // Increment total flash writes with GC writes
             mark_block_free(ssd, &ppa);
 
             if (spp->enable_gc_delay) {
@@ -798,6 +846,9 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         srd.stime = req->stime;
         sublat = ssd_advance_status(ssd, &ppa, &srd);
         maxlat = (sublat > maxlat) ? sublat : maxlat;
+
+        iops_count++; // Increment IOPS count
+        bytes_transferred += nsecs * spp->secsz; // Increment bytes transferred
     }
 
     return maxlat;
@@ -853,6 +904,9 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         /* get latency statistics */
         curlat = ssd_advance_status(ssd, &ppa, &swr);
         maxlat = (curlat > maxlat) ? curlat : maxlat;
+
+        iops_count++; // Increment IOPS count
+        bytes_transferred += len * spp->secsz; // Increment bytes transferred
     }
 
     return maxlat;
@@ -867,6 +921,9 @@ static void *ftl_thread(void *arg)
     int rc;
     int i;
 
+    // Track the last time we logged metrics
+    time_t last_log_time = time(NULL);
+
     while (!*(ssd->dataplane_started_ptr)) {
         usleep(100000);
     }
@@ -876,6 +933,13 @@ static void *ftl_thread(void *arg)
     ssd->to_poller = n->to_poller;
 
     while (1) {
+        // Check if one second has passed since the last time we logged metrics
+        time_t current_time = time(NULL);
+        if (current_time - last_log_time >= 1) {
+            log_metrics(); // Log metrics
+            last_log_time = current_time; // Update last log time
+        }
+
         for (i = 1; i <= n->nr_pollers; i++) {
             if (!ssd->to_ftl[i] || !femu_ring_count(ssd->to_ftl[i]))
                 continue;
